@@ -24,7 +24,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from vnpy.trader.constant import Exchange, Interval
+from vnpy.trader.constant import Exchange, Interval, Direction, Offset
 from vnpy.trader.object import BarData
 from vnpy_ctastrategy.backtesting import BacktestingEngine
 
@@ -293,14 +293,14 @@ def _print_trade_analysis(trades: list):
     pairs = []
     open_trade = None
     for t in sorted_trades:
-        if t.offset and "OPEN" in str(t.offset).upper():
+        if t.offset == Offset.OPEN:
             if open_trade is not None:
                 # 前一个开仓未平, 跳过
                 pass
             open_trade = t
-        elif t.offset and "CLOSE" in str(t.offset).upper():
+        elif t.offset in (Offset.CLOSE, Offset.CLOSETODAY, Offset.CLOSEYESTERDAY):
             if open_trade is not None:
-                if str(open_trade.direction) == "LONG":
+                if open_trade.direction == Direction.LONG:
                     pnl = (t.price - open_trade.price) * CONTRACT_SIZE * t.volume
                 else:
                     pnl = (open_trade.price - t.price) * CONTRACT_SIZE * t.volume
@@ -319,7 +319,7 @@ def _print_trade_analysis(trades: list):
             if open_trade is None:
                 open_trade = t
             else:
-                if str(open_trade.direction) == "LONG":
+                if open_trade.direction == Direction.LONG:
                     pnl = (t.price - open_trade.price) * CONTRACT_SIZE * t.volume
                 else:
                     pnl = (open_trade.price - t.price) * CONTRACT_SIZE * t.volume
@@ -466,7 +466,14 @@ if __name__ == "__main__":
             csv_arg = sys.argv[idx + 1]
 
     if csv_arg:
-        global CSV_PATH
-        CSV_PATH = csv_arg
+        # 直接传参, 不用global (避免SyntaxError)
+        _run_with_csv(csv_arg, start, end, show_chart)
+    else:
+        run_backtest(start, end, show_chart=show_chart)
 
+
+def _run_with_csv(csv_path: str, start: datetime, end: datetime, show_chart: bool):
+    """用指定CSV路径运行回测"""
+    global CSV_PATH
+    CSV_PATH = csv_path
     run_backtest(start, end, show_chart=show_chart)

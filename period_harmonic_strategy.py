@@ -4,18 +4,20 @@ vnpy CTA 策略: 周期谐波震荡策略 (Period Harmonic Oscillation) v3.2
 v3.2 全面重构 (基于 Codex 第三轮审查):
   三周期分层共振: 14分钟定趋势, 4分钟确认, 1分钟触发入场
   S1: 预热阶段不设order_pending (检查self.trading)
-  S2: 止损用停止单(stop=True)预挂, on_order/on_stop_order处理拒绝/撤销
+  S2: 止损用停止单(stop=True)预挂, on_stop_order用stop_orderid属性
   S3: 平仓后清除旧方向止损, 新开仓重新设置
   S4: 定时平仓用市价方向+order_pending, 禁止收盘后重开
   S5: 信号与K线边界对齐, 各周期只在完整K线收盘时更新
   S6: 14分钟反转只平仓不反手; 日切/暂停时清理状态
   S7: on_trade检查offset, 盈亏统计含双边成本, 多笔成交累积
   S8: 移除假参数, 暂停周期修正为14*LONG_PERIOD
-  S9: 重采样按真实时间取整, 午休加60分钟间隙
+  S9: 重采样按交易时段独立零点(09:15/13:00/17:15)
   S10: resample内部丢弃不完整K线组
   S11: 止盈改为开仓时固定, 不随价格更新
   S12: 限价单超时2根K线自动撤单
-  S13: 14分钟反转平仓, 不立即反手; 新方向需重新确认+触发
+  S13: 14分钟反转平仓优先于风控检查, 不被暂停/亏损拦截
+  S14: 4min/14min信号缓存, 仅在边界时重算(性能优化)
+  S15: backtest_hsi.py用Direction/Offset枚举, 修复语法错误
 """
 
 from datetime import datetime, timedelta
@@ -124,6 +126,10 @@ class PeriodHarmonicStrategy(CtaTemplate):
         self._last_4min_group: int = -1
         self._last_14min_group: int = -1
 
+        # S14: 信号缓存 (4min/14min只在边界时重算)
+        self._cached_4min_signal: int = 0
+        self._cached_14min_signal: int = 0
+
         # 订单ID追踪
         self.stop_orderid: str = ""
         self.tp_orderid: str = ""
@@ -209,18 +215,13 @@ class PeriodHarmonicStrategy(CtaTemplate):
                 self.write_log(f"日切: long_dir={self.long_direction} mid_dir={self.middle_direction}")
             self.prev_short_direction = 0
 
-        # 3. 连亏暂停
+        # 3. 连亏暂停触发 (只设倒计时, 不return)
         if self.loss_num >= self.LOSS_CHANCE:
             self.pausing_countdown = self.PAUSING_PERIOD * self.LONG_PERIOD
             self.loss_num = 0
             self.write_log(f"连亏暂停 {self.pausing_countdown} 根K线")
 
-        if self.pausing_countdown > 0:
-            self.pausing_countdown -= 1
-            self.put_event()
-            return
-
-        # 4. 定时平仓
+        # 4. 定时平仓 (优先于一切风控, 确保收盘前能平掉)
         current_minute = bar.datetime.hour * 60 + bar.datetime.minute
         is_close_time = (
             abs(current_minute - self.CLOSE_TIME_1) <= 1 or
@@ -241,37 +242,22 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.put_event()
             return
 
-        # 收盘后窗口内禁止开新仓
-        if (abs(current_minute - self.CLOSE_TIME_1) <= self.CLOSE_GUARD_WINDOW or
-            abs(current_minute - self.CLOSE_TIME_2) <= self.CLOSE_GUARD_WINDOW):
-            self.put_event()
-            return
+        # 收盘后窗口内禁止开新仓 (但允许已有仓位管理)
+        in_close_guard = (
+            abs(current_minute - self.CLOSE_TIME_1) <= self.CLOSE_GUARD_WINDOW or
+            abs(current_minute - self.CLOSE_TIME_2) <= self.CLOSE_GUARD_WINDOW
+        )
 
-        # 5. 信号计算 (分层更新)
-        self._update_signals(bar)
+        # 5. 信号计算 (分层更新) - 在风控检查之前, 因为14分钟反转需要信号
+        if not in_close_guard:
+            self._update_signals(bar)
 
         # 6. 更新止损止盈 (S11: 止盈只在开仓时设置)
         # 止损预挂单模式下, 止损上移时更新停止单
         if self.pos != 0 and self.stop_price is not None:
             self._update_trailing_stop(bar)
 
-        # 7. 入场/平仓判断
-        if self.daily_loss >= self.DAILY_MAX_LOSS:
-            self.put_event()
-            return
-
-        if self.order_pending:
-            self.put_event()
-            return
-
-        # 计算趋势和入场信号
-        trend = self.long_direction if (self.long_direction == self.middle_direction != 0) else 0
-        entry_signal = 0
-        if trend != 0:
-            if self.short_direction == trend and self.prev_short_direction != trend:
-                entry_signal = trend
-
-        # 7a. 14分钟反转 → 只平仓, 不反手
+        # 7a. 14分钟反转平仓 (优先于暂停/亏损/order_pending, 确保持仓能退出)
         if self.pos > 0 and self.long_direction == -1:
             self.write_log(f"14分钟转空, 平多仓 close={bar.close_price} bar_count={self.bar_count}")
             self.cancel_all()
@@ -290,7 +276,36 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.put_event()
             return
 
-        # 7b. 入场 (空仓 + entry_signal)
+        # 7b. 连亏暂停 (在反转平仓之后, 不阻止仓位退出)
+        if self.pausing_countdown > 0:
+            self.pausing_countdown -= 1
+            self.put_event()
+            return
+
+        # 7c. 收盘后窗口禁止开新仓
+        if in_close_guard:
+            self.put_event()
+            return
+
+        # 7d. 每日亏损限制 (在反转平仓之后, 不阻止仓位退出)
+        if self.daily_loss >= self.DAILY_MAX_LOSS:
+            self.put_event()
+            return
+
+        # 7e. 订单挂起检查
+        if self.order_pending:
+            self.put_event()
+            return
+
+        # 8. 入场判断
+        # 计算趋势和入场信号
+        trend = self.long_direction if (self.long_direction == self.middle_direction != 0) else 0
+        entry_signal = 0
+        if trend != 0:
+            if self.short_direction == trend and self.prev_short_direction != trend:
+                entry_signal = trend
+
+        # 8a. 入场 (空仓 + entry_signal)
         if entry_signal == 1 and self.pos == 0:
             self.write_log(
                 f"开多 entry_signal=1 close={bar.close_price} bar_count={self.bar_count} "
@@ -393,13 +408,14 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
     def on_stop_order(self, stop_order: StopOrder):
         """S2: 停止单状态变化"""
+        # vn.py 4.4 StopOrder 属性是 stop_orderid, 不是 vt_orderid
         if stop_order.status.name == "CANCELLED":
             self.write_log(f"停止单被撤销")
-            if stop_order.vt_orderid == self.stop_orderid:
+            if stop_order.stop_orderid == self.stop_orderid:
                 self.stop_orderid = ""
         elif stop_order.status.name == "TRIGGERED":
             self.write_log(f"停止单已触发, 等待成交")
-            if stop_order.vt_orderid == self.stop_orderid:
+            if stop_order.stop_orderid == self.stop_orderid:
                 self.stop_orderid = ""
             # 止损触发 → 撤销止盈单
             if self.tp_orderid:
@@ -438,32 +454,38 @@ class PeriodHarmonicStrategy(CtaTemplate):
     # ================================================================
 
     def _update_signals(self, bar: BarData):
-        """分层更新三个周期方向"""
+        """分层更新三个周期方向 (S14: 4min/14min仅在边界时重算)"""
 
-        # 1分钟信号每根bar更新
+        # 1分钟信号每根bar更新 (数据量小, 直接算)
         new_short = self._calc_signal_for_period(self.SHORT_PERIOD)
         self.prev_short_direction = self.short_direction
         self.short_direction = new_short
 
-        # 4分钟信号仅在组边界更新
+        # 4分钟信号: 仅在组边界时重算, 否则用缓存
         if self._check_period_boundary(bar, self.MIDDLE_PERIOD):
             new_middle = self._calc_signal_for_period(self.MIDDLE_PERIOD)
+            self._cached_4min_signal = new_middle
             if new_middle != self.middle_direction:
                 self.write_log(
                     f"4分钟信号更新: {self.middle_direction}→{new_middle} bar_count={self.bar_count}"
                 )
             self.middle_direction = new_middle
+        else:
+            self.middle_direction = self._cached_4min_signal
 
-        # 14分钟信号仅在组边界更新
+        # 14分钟信号: 仅在组边界时重算, 否则用缓存
         if self._check_period_boundary(bar, self.LONG_PERIOD):
             new_long = self._calc_signal_for_period(self.LONG_PERIOD)
+            self._cached_14min_signal = new_long
             if new_long != self.long_direction:
                 self.write_log(
                     f"14分钟信号更新: {self.long_direction}→{new_long} bar_count={self.bar_count}"
                 )
             self.long_direction = new_long
+        else:
+            self.long_direction = self._cached_14min_signal
 
-        # 更新ATR
+        # 更新ATR (每根bar更新, 计算量小)
         ohlcv_2d = np.array([
             self.am.open_array,
             self.am.high_array,
@@ -492,20 +514,25 @@ class PeriodHarmonicStrategy(CtaTemplate):
     # ================================================================
 
     def _get_day_minutes(self, dt: datetime) -> int:
-        """计算日内分钟序号 (S9: 午休加60分钟间隙)"""
+        """计算交易时段内分钟序号 (按09:15/13:00/17:15分别零点)"""
         h, m = dt.hour, dt.minute
+
+        # 夜盘: 17:15 - 次日02:59 (17:15为零点)
         if h >= 17:
-            return (h - 17) * 60 + m
+            return (h - 17) * 60 + (m - 15)
         elif h < 5:
-            return (h + 7) * 60 + m
-        elif h >= 13:
-            # 午休后: 加60分钟间隙, 防止跨午休拼接
-            return 225 + (h - 13) * 60 + m   # 225 = 165 + 60
-        elif h >= 9:
-            day_min = (h - 9) * 60 + m - 15
-            return max(day_min, 0)
+            # 次日凌晨, 继续夜盘序号
+            # 17:15到23:59 = 404分钟, 00:00继续
+            return 404 + h * 60 + m + 1   # 404 = (23-17)*60 + (59-15) + 1
+        # 上午盘: 09:15 - 11:59 (09:15为零点)
+        elif h >= 9 and h < 12:
+            return (h - 9) * 60 + (m - 15)
+        # 下午盘: 13:00 - 16:29 (13:00为零点, 加10000与上午区分)
+        elif h >= 13 and h < 17:
+            return 10000 + (h - 13) * 60 + m
         else:
-            return 0
+            # 05:00-08:59 或 12:00-12:59 (午休)
+            return -1  # 无效时段
 
     def _check_period_boundary(self, bar: BarData, period: int) -> bool:
         """检查是否在指定周期K线组完成时"""
@@ -518,7 +545,13 @@ class PeriodHarmonicStrategy(CtaTemplate):
             tday = dt.toordinal()
 
         day_minutes = self._get_day_minutes(dt)
-        group = tday * 100000 + day_minutes // period
+        if day_minutes < 0:
+            return False  # 无效时段
+
+        # 按时段+交易日+组编号生成唯一key
+        session = day_minutes // 10000  # 0=夜盘, 0=上午, 1=下午
+        session_minutes = day_minutes % 10000 if session >= 1 else day_minutes
+        group = tday * 1000000 + session * 100000 + session_minutes // period
 
         if period == self.MIDDLE_PERIOD:
             if group != self._last_4min_group:
@@ -534,7 +567,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
             return True  # 1分钟每根都是边界
 
     def _resample_by_time(self, ohlcv: np.ndarray, datetimes: list, period: int) -> np.ndarray:
-        """S9/S10: 按真实时间取整重采样, 跳过午休, 丢弃不完整组"""
+        """S9/S10: 按交易时段重采样, 每个时段独立零点, 丢弃不完整组"""
         if period == 1:
             return ohlcv.copy()
 
@@ -542,7 +575,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
         if n == 0:
             return np.empty((5, 0))
 
-        # 计算每个bar的交易日和时间组
+        # 计算每个bar的交易日+时段+组编号
         group_ids = np.empty(n, dtype=np.int64)
         for i, dt in enumerate(datetimes):
             if dt.hour >= 17:
@@ -550,7 +583,13 @@ class PeriodHarmonicStrategy(CtaTemplate):
             else:
                 tday = dt.toordinal()
             day_min = self._get_day_minutes(dt)
-            group_ids[i] = tday * 100000 + day_min // period
+            if day_min < 0:
+                # 无效时段: 赋一个唯一的大值, 使其自成一组(之后会被丢弃)
+                group_ids[i] = -1
+                continue
+            session = day_min // 10000
+            session_minutes = day_min % 10000 if session >= 1 else day_min
+            group_ids[i] = tday * 1000000 + session * 100000 + session_minutes // period
 
         # 找组边界
         group_change = np.empty(n, dtype=bool)
