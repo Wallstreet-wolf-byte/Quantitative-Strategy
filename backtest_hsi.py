@@ -55,8 +55,6 @@ STRATEGY_SETTING = {
     "LONG_PERIOD": 14,
     "SIGNAL_THRESH": 2,
     "RSV_WINDOW": 9,
-    "K_WINDOW": 3,
-    "D_WINDOW": 3,
     "ATR_WINDOW": 14,
     "RED_THRESHOLD": 80.0,
     "GREEN_THRESHOLD": 20.0,

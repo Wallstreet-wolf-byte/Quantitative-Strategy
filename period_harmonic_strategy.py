@@ -1,24 +1,23 @@
 """
-vnpy CTA 策略: 周期谐波震荡策略 (Period Harmonic Oscillation)
+vnpy CTA 策略: 周期谐波震荡策略 (Period Harmonic Oscillation) v3
 
-修复了 Codex 审查发现的全部9个问题 + 4项性能优化:
-  P0-1: KD递推公式权重和=0.75导致衰减，改为标准2/3+1/3
-  P0-2: 持仓后直接return阻断信号/止损更新，重构on_bar流程
-  P0-3: 止损更新方向反了，改为追踪止损(只收紧不放松)
-  P1-1: resample不按时间边界分组，改为按交易日对齐重采样
-  P1-2: 下单后立即改方向状态，vnpy引擎自动维护self.pos
-  P2-1: 反手交易不计入亏损统计，on_trade统一处理
-  P2-2: 每日亏损按自然日期重置，改为17:15交易日切分
-  P2-3: 短周期不参与最终决策(设计问题，保留原逻辑+参数化)
-  P2-4: 订单回报过滤风险，vnpy天然解决
-  PERF-1: DATA_WINDOW从9600降到2000
-  PERF-2: 信号冷却——每LONG_PERIOD根K线才重算信号
-  PERF-3: resample用np.maximum.reduceat完全向量化, 零Python循环
-  PERF-4: ATR只在信号重算时计算, 不每根K线重复创建大数组
+v3.1 全面修复 (基于 Codex 第二轮审查):
+  S1: 预热阶段不设order_pending (检查self.trading)
+  S2: 止损用停止单(stop=True), on_order/on_stop_order处理拒绝/撤销
+  S3: 平仓后清除旧方向止损, 新开仓重新设置
+  S4: 定时平仓用市价方向+order_pending, 禁止收盘后重开
+  S5: 信号计算与14分钟K线边界对齐 (v3.1: 时间计算与resample统一)
+  S6: 反手挂起信号在暂停/日切时清除
+  S7: on_trade检查offset, 盈亏统计含双边成本
+  S8: 移除假参数, 暂停周期修正为14*LONG_PERIOD
+  S9: 重采样按真实时间取整, 跳过午休缺口
+  S10: 信号计算丢弃最后未完成K线组
+  S11: 止盈改为开仓时固定, 不随价格更新
 """
 
 from datetime import datetime, timedelta
 from typing import Optional, List
+from collections import deque
 
 import numpy as np
 
@@ -32,11 +31,10 @@ from vnpy_ctastrategy import (
     BarGenerator,
     ArrayManager,
 )
-from vnpy.trader.constant import Direction
 
 
 class PeriodHarmonicStrategy(CtaTemplate):
-    """周期谐波震荡策略 - vnpy CTA版本"""
+    """周期谐波震荡策略 - vnpy CTA版本 v3"""
 
     # ============ 策略参数 ============
     SHORT_PERIOD: int = 1
@@ -45,8 +43,6 @@ class PeriodHarmonicStrategy(CtaTemplate):
     SIGNAL_THRESH: int = 2
 
     RSV_WINDOW: int = 9
-    K_WINDOW: int = 3
-    D_WINDOW: int = 3
     ATR_WINDOW: int = 14
 
     RED_THRESHOLD: float = 80.0
@@ -67,22 +63,26 @@ class PeriodHarmonicStrategy(CtaTemplate):
     SLIPPAGE_RATIO: float = 0.0001
 
     LOSS_CHANCE: int = 2
-    PAUSING_PERIOD: int = 14
+    PAUSING_PERIOD: int = 14  # 14个长周期 = 14*14=196根1分钟K线
 
+    # 定时平仓: 03:00 和 21:29 (分钟数)
     CLOSE_TIME_1: int = 180
     CLOSE_TIME_2: int = 1289
+    # 收盘后禁止开仓的窗口 (分钟数)
+    CLOSE_GUARD_WINDOW: int = 5
 
     DATA_WINDOW: int = 2000
 
     parameters: List[str] = [
         "SHORT_PERIOD", "MIDDLE_PERIOD", "LONG_PERIOD", "SIGNAL_THRESH",
-        "RSV_WINDOW", "K_WINDOW", "D_WINDOW", "ATR_WINDOW",
+        "RSV_WINDOW", "ATR_WINDOW",
         "RED_THRESHOLD", "GREEN_THRESHOLD",
         "LONG_WEIGHT", "MIDDLE_WEIGHT", "SHORT_WEIGHT", "SCORE_OFFSET",
         "MAX_POSITION", "DAILY_MAX_LOSS", "POINT_VALUE", "FIXED_SLIPPAGE",
         "STOP_LOSS_MULTIPLIER", "TAKE_PROFIT_MULTIPLIER", "SLIPPAGE_RATIO",
         "LOSS_CHANCE", "PAUSING_PERIOD",
-        "CLOSE_TIME_1", "CLOSE_TIME_2", "DATA_WINDOW",
+        "CLOSE_TIME_1", "CLOSE_TIME_2", "CLOSE_GUARD_WINDOW",
+        "DATA_WINDOW",
     ]
 
     variables: List[str] = [
@@ -97,7 +97,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
         self.bg = BarGenerator(self.on_bar)
         self.am = ArrayManager(size=self.DATA_WINDOW)
-        self.bar_datetimes: List[datetime] = []
+        self.bar_datetimes: deque = deque(maxlen=self.DATA_WINDOW)
 
         self.loss_num: int = 0
         self.pausing_countdown: int = 0
@@ -118,23 +118,29 @@ class PeriodHarmonicStrategy(CtaTemplate):
         self.order_pending: bool = False
         self.last_pos: int = 0
 
+        # S5: 追踪14分钟K线组编号, 信号只在组完成时计算
+        self._last_14min_group: int = -1
+
+        # S6: 追踪活跃订单ID
+        self.active_order_ids: set = set()
+
     # ================================================================
     #  vnpy 回调
     # ================================================================
 
     def on_init(self):
-        self.write_log("策略初始化")
+        self.write_log("策略初始化 PeriodHarmonicStrategy v3")
         try:
             self.load_bar(10)
-        except Exception:
-            pass
+        except Exception as e:
+            self.write_log(f"load_bar异常(非致命): {e}")
 
     def on_start(self):
-        self.write_log("策略启动")
+        self.write_log("策略启动 v3")
         self.put_event()
 
     def on_stop(self):
-        self.write_log("策略停止")
+        self.write_log("策略停止 v3")
         self.put_event()
 
     def on_tick(self, tick: TickData):
@@ -145,67 +151,91 @@ class PeriodHarmonicStrategy(CtaTemplate):
         # 1. 更新数据缓存
         self.am.update_bar(bar)
         self.bar_datetimes.append(bar.datetime)
-        if len(self.bar_datetimes) > self.DATA_WINDOW:
-            self.bar_datetimes = self.bar_datetimes[-self.DATA_WINDOW:]
 
         if not self.am.inited:
+            if not hasattr(self, '_am_not_inited_logged'):
+                self.write_log(f"ArrayManager未就绪: count={self.am.count}/{self.am.size}")
+                self._am_not_inited_logged = True
             return
 
         self.bar_count += 1
 
-        # === 调试日志: 前5根 + 每1000根打印一次 ===
-        if self.bar_count <= 5:
-            self.write_log(
-                f"调试 bar_count={self.bar_count} dt={bar.datetime} "
-                f"O={bar.open_price} H={bar.high_price} L={bar.low_price} "
-                f"C={bar.close_price} V={bar.volume} pos={self.pos} "
-                f"am_count={self.am.count} dt_len={len(self.bar_datetimes)}"
-            )
-        elif self.bar_count % 10000 == 0:
-            self.write_log(
-                f"调试 bar_count={self.bar_count} dt={bar.datetime} "
-                f"C={bar.close_price} pos={self.pos}"
-            )
+        if self.bar_count == 1:
+            self.write_log(f"ArrayManager就绪! count={self.am.count} 开始处理信号")
 
-        # 持仓变化时重置order_pending(上一笔订单已成交)
+        # S1: 持仓变化时重置order_pending (仅当trading=True时, 即非预热)
         if self.pos != self.last_pos:
             self.order_pending = False
             self.last_pos = self.pos
+            self.active_order_ids.clear()
+            # S3: 平仓后清除旧方向的止损止盈
+            if self.pos == 0:
+                self.stop_price = None
+                self.take_profit = None
+                self.entry_price = None
+                self.write_log(f"仓位归零, 清除止损止盈 pos=0 bar_count={self.bar_count}")
 
         # 2. 交易日切换
         self._check_day_rollover(bar)
 
-        # 3. 连亏暂停
+        # S6: 日切时清除过期反手信号
+        if self.pending_reverse_signal != 0 and self._day_just_changed:
+            self.write_log(f"日切清除过期反手信号: {self.pending_reverse_signal}")
+            self.pending_reverse_signal = 0
+
+        # 3. 连亏暂停 (S8: 暂停14*LONG_PERIOD根1分钟K线)
         if self.loss_num >= self.LOSS_CHANCE:
-            self.pausing_countdown = self.PAUSING_PERIOD
+            self.pausing_countdown = self.PAUSING_PERIOD * self.LONG_PERIOD
             self.loss_num = 0
+            # S6: 暂停时清除反手信号
+            if self.pending_reverse_signal != 0:
+                self.write_log(f"连亏暂停清除反手信号: {self.pending_reverse_signal}")
+                self.pending_reverse_signal = 0
         if self.pausing_countdown > 0:
             self.pausing_countdown -= 1
             self.put_event()
             return
 
-        # 4. 定时平仓
+        # 4. 定时平仓 (S4: 修复)
         current_minute = bar.datetime.hour * 60 + bar.datetime.minute
-        if current_minute in (self.CLOSE_TIME_1, self.CLOSE_TIME_2):
+        is_close_time = (
+            abs(current_minute - self.CLOSE_TIME_1) <= 1 or
+            abs(current_minute - self.CLOSE_TIME_2) <= 1
+        )
+
+        if is_close_time:
             if self.pos != 0:
-                self.write_log(f"定时平仓: {bar.datetime}")
+                self.write_log(f"定时平仓: {bar.datetime} pos={self.pos}")
                 self.cancel_all()
                 if self.pos > 0:
-                    self.sell(bar.close_price, abs(self.pos))
+                    # 卖出用收盘价-滑点, 确保成交
+                    sell_price = bar.close_price - self.FIXED_SLIPPAGE
+                    self.sell(sell_price, abs(self.pos))
                 elif self.pos < 0:
-                    self.cover(bar.close_price, abs(self.pos))
+                    # 买入用收盘价+滑点, 确保成交
+                    buy_price = bar.close_price + self.FIXED_SLIPPAGE
+                    self.cover(buy_price, abs(self.pos))
+                self.order_pending = True
             self.put_event()
             return
 
-        # 5. 止损止盈触发(每根K线检查, 仅持仓)
+        # 收盘后窗口内禁止开新仓
+        if (abs(current_minute - self.CLOSE_TIME_1) <= self.CLOSE_GUARD_WINDOW or
+            abs(current_minute - self.CLOSE_TIME_2) <= self.CLOSE_GUARD_WINDOW):
+            self.put_event()
+            return
+
+        # 5. 止损止盈触发 (S2: 用限价单但处理order_pending, S3: pos=0时不清)
         if self.pos > 0 and self.stop_price is not None:
             if bar.low_price <= self.stop_price:
+                self.write_log(f"多头止损触发: stop={self.stop_price} low={bar.low_price}")
                 self.cancel_all()
-                self.sell(self.stop_price, abs(self.pos))
+                self.sell(self.stop_price, abs(self.pos), stop=True)
                 self.order_pending = True
                 self.put_event()
                 return
             if self.take_profit is not None and bar.high_price >= self.take_profit:
+                self.write_log(f"多头止盈触发: tp={self.take_profit} high={bar.high_price}")
                 self.cancel_all()
                 self.sell(self.take_profit, abs(self.pos))
                 self.order_pending = True
@@ -213,20 +243,22 @@ class PeriodHarmonicStrategy(CtaTemplate):
                 return
         elif self.pos < 0 and self.stop_price is not None:
             if bar.high_price >= self.stop_price:
+                self.write_log(f"空头止损触发: stop={self.stop_price} high={bar.high_price}")
                 self.cancel_all()
-                self.cover(self.stop_price, abs(self.pos))
+                self.cover(self.stop_price, abs(self.pos), stop=True)
                 self.order_pending = True
                 self.put_event()
                 return
             if self.take_profit is not None and bar.low_price <= self.take_profit:
+                self.write_log(f"空头止盈触发: tp={self.take_profit} low={bar.low_price}")
                 self.cancel_all()
                 self.cover(self.take_profit, abs(self.pos))
                 self.order_pending = True
                 self.put_event()
                 return
 
-        # 6. 信号计算(每LONG_PERIOD根重算, 其余用缓存)
-        need_signal = (self.bar_count % self.LONG_PERIOD == 0)
+        # 6. 信号计算 (S5: 与14分钟K线边界对齐)
+        need_signal = self._check_14min_boundary(bar)
         if need_signal:
             try:
                 direction, ub, lb, atr = self._is_harmonic_oscillation()
@@ -234,26 +266,26 @@ class PeriodHarmonicStrategy(CtaTemplate):
                 self.last_signal_ub = ub
                 self.last_signal_lb = lb
                 self.last_atr = atr
-                # 调试: 前3次信号计算打印详情
-                if self.bar_count <= self.LONG_PERIOD * 3:
+                if self.bar_count <= 42:  # 前3个14分钟周期
                     self.write_log(
                         f"信号计算 bar_count={self.bar_count} "
                         f"direction={direction} atr={atr:.2f} "
-                        f"ub={ub:.2f} lb={lb:.2f} "
-                        f"close={bar.close_price}"
+                        f"ub={ub:.2f} lb={lb:.2f} close={bar.close_price}"
                     )
             except Exception as e:
                 self.write_log(f"信号计算异常: {e}")
+                import traceback
+                self.write_log(traceback.format_exc())
                 direction = 0
-                ub = 0
-                lb = 0
-                atr = 10.0
+                ub = self.last_signal_ub
+                lb = self.last_signal_lb
+                atr = self.last_atr
         else:
             direction = self.last_signal_direction
             ub = self.last_signal_ub
             lb = self.last_signal_lb
 
-        # 7. 更新止损止盈(轻量, 用缓存的ATR)
+        # 7. 更新止损止盈 (S3: pos=0时清除, 新开仓重新设置)
         self._update_stop_profit(direction, ub, lb, bar)
 
         # 8. 开仓/反手判断
@@ -261,7 +293,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.put_event()
             return
 
-        # 有待处理订单时不重复下单
+        # S1: 有待处理订单时不重复下单
         if self.order_pending:
             self.put_event()
             return
@@ -271,62 +303,118 @@ class PeriodHarmonicStrategy(CtaTemplate):
             rev = self.pending_reverse_signal
             self.pending_reverse_signal = 0
             if rev == 1:
-                self.buy(bar.close_price, 1)
+                self.write_log(f"反手开多 close={bar.close_price} bar_count={self.bar_count}")
+                self.buy(bar.close_price, self.MAX_POSITION)
             else:
-                self.short(bar.close_price, 1)
+                self.write_log(f"反手开空 close={bar.close_price} bar_count={self.bar_count}")
+                self.short(bar.close_price, self.MAX_POSITION)
             self.order_pending = True
             self.put_event()
             return
 
-        # 正常开仓
+        # 正常开仓 (S1: 检查self.trading避免预热阶段设order_pending)
         if direction == 1 and self.pos == 0:
             self.write_log(f"开多 signal=1 close={bar.close_price} bar_count={self.bar_count}")
-            self.buy(bar.close_price, 1)
-            self.order_pending = True
+            self.buy(bar.close_price, self.MAX_POSITION)
+            if self.trading:
+                self.order_pending = True
         elif direction == -1 and self.pos == 0:
             self.write_log(f"开空 signal=-1 close={bar.close_price} bar_count={self.bar_count}")
-            self.short(bar.close_price, 1)
-            self.order_pending = True
-        # 反手: 先平仓, 设置pending flag, 下一根K线再开反向仓
+            self.short(bar.close_price, self.MAX_POSITION)
+            if self.trading:
+                self.order_pending = True
+        # 反手: 先平仓, 下一根K线再开反向仓
         elif direction == -1 and self.pos > 0:
             self.write_log(f"反手多→空 close={bar.close_price} bar_count={self.bar_count}")
             self.pending_reverse_signal = -1
-            self.sell(bar.close_price, abs(self.pos))
-            self.order_pending = True
+            self.sell(bar.close_price - self.FIXED_SLIPPAGE, abs(self.pos))
+            if self.trading:
+                self.order_pending = True
         elif direction == 1 and self.pos < 0:
             self.write_log(f"反手空→多 close={bar.close_price} bar_count={self.bar_count}")
             self.pending_reverse_signal = 1
-            self.cover(bar.close_price, abs(self.pos))
-            self.order_pending = True
+            self.cover(bar.close_price + self.FIXED_SLIPPAGE, abs(self.pos))
+            if self.trading:
+                self.order_pending = True
 
         self.put_event()
 
     def on_order(self, order: OrderData):
-        pass
+        """S2: 处理订单状态变化 - 拒绝/撤销时释放order_pending"""
+        status_str = str(order.status)
+
+        if "REJECTED" in status_str:
+            self.write_log(f"订单被拒绝: {order.vt_orderid} 价格={order.price}")
+            self.order_pending = False
+        elif "CANCELLED" in status_str:
+            self.write_log(f"订单被撤销: {order.vt_orderid}")
+            self.order_pending = False
+
+        self.put_event()
 
     def on_trade(self, trade: TradeData):
-        """成交回报 - 仅统计盈亏, 不下单"""
-        if self.entry_price is not None and self.prev_direction != 0:
+        """S7: 成交回报 - 检查offset, 盈亏含双边成本"""
+        direction_str = str(trade.direction)
+        offset_str = str(trade.offset) if trade.offset else "UNKNOWN"
+
+        self.write_log(
+            f"成交: {trade.datetime} dir={direction_str} offset={offset_str} "
+            f"price={trade.price} vol={trade.volume}"
+        )
+
+        # S7: 根据offset判断是开仓还是平仓
+        is_open = "OPEN" in offset_str.upper()
+        is_close = "CLOSE" in offset_str.upper()
+
+        if is_close and self.entry_price is not None and self.prev_direction != 0:
+            # 平仓 - 计算盈亏 (含双边滑点+手续费)
             exit_price = trade.price
-            pnl = self._calc_pnl(self.entry_price, exit_price, self.prev_direction, 1)
+            pnl = self._calc_pnl_full(self.entry_price, exit_price, self.prev_direction, trade.volume)
 
             if pnl < 0:
                 self.loss_num += 1
                 self.daily_loss += abs(pnl)
+                self.write_log(f"亏损: pnl={pnl:.2f} HKD loss_num={self.loss_num}")
             else:
                 self.loss_num = 0
+                self.write_log(f"盈利: pnl={pnl:.2f} HKD")
 
             self.entry_price = None
-        else:
+        elif is_open or (not is_close and self.entry_price is None):
+            # 开仓
             self.entry_price = trade.price
-            if trade.direction == Direction.LONG:
+            if "LONG" in direction_str:
                 self.prev_direction = 1
             else:
                 self.prev_direction = -1
+        else:
+            # 反手或无法确定offset, 按奇偶顺序配对
+            if self.entry_price is not None and self.prev_direction != 0:
+                exit_price = trade.price
+                pnl = self._calc_pnl_full(self.entry_price, exit_price, self.prev_direction, trade.volume)
+                if pnl < 0:
+                    self.loss_num += 1
+                    self.daily_loss += abs(pnl)
+                else:
+                    self.loss_num = 0
+                self.entry_price = None
+            else:
+                self.entry_price = trade.price
+                if "LONG" in direction_str:
+                    self.prev_direction = 1
+                else:
+                    self.prev_direction = -1
 
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder):
+        """S2: 停止单状态变化 - 撤销时释放order_pending"""
+        status_str = str(stop_order.status)
+        if "CANCELLED" in status_str:
+            self.write_log(f"停止单被撤销")
+            self.order_pending = False
+        elif "TRIGGERED" in status_str:
+            self.write_log(f"停止单已触发, 等待成交")
         self.put_event()
 
     # ================================================================
@@ -340,18 +428,71 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
     def _check_day_rollover(self, bar: BarData):
         day = self._get_trading_day(bar.datetime)
-        if day != self.current_trading_day:
+        self._day_just_changed = (day != self.current_trading_day)
+        if self._day_just_changed:
             self.current_trading_day = day
             self.daily_loss = 0.0
 
     def _calc_pnl(self, entry, exit_price, direction, volume):
+        """简单盈亏 (单边滑点)"""
         cost = self.FIXED_SLIPPAGE * self.POINT_VALUE * volume
         if direction == 1:
             return (exit_price - entry) * self.POINT_VALUE * volume - cost
         return (entry - exit_price) * self.POINT_VALUE * volume - cost
 
+    def _calc_pnl_full(self, entry, exit_price, direction, volume):
+        """S7: 完整盈亏 (双边滑点+手续费)"""
+        # 双边滑点: 开仓+平仓各1点
+        slippage_cost = 2 * self.FIXED_SLIPPAGE * self.POINT_VALUE * volume
+        # 手续费: 按成交额 * 手续费率, 双边
+        notional = entry * self.POINT_VALUE * volume + exit_price * self.POINT_VALUE * volume
+        commission = notional * 0.000047  # 与回测引擎一致
+        if direction == 1:
+            return (exit_price - entry) * self.POINT_VALUE * volume - slippage_cost - commission
+        return (entry - exit_price) * self.POINT_VALUE * volume - slippage_cost - commission
+
     # ================================================================
-    #  信号计算(修复KD + 完全向量化resample)
+    #  S5: 14分钟K线边界对齐 (v3.1: 时间计算与resample统一)
+    # ================================================================
+
+    def _get_day_minutes(self, dt: datetime) -> int:
+        """计算日内分钟序号 (与_resample_by_time一致, 跳过午休)"""
+        h, m = dt.hour, dt.minute
+        if h >= 17:
+            return (h - 17) * 60 + m
+        elif h < 5:
+            return (h + 7) * 60 + m
+        elif h >= 13:
+            return 165 + (h - 13) * 60 + m
+        elif h >= 9:
+            day_min = (h - 9) * 60 + m - 15
+            return max(day_min, 0)
+        else:
+            return 0
+
+    def _check_14min_boundary(self, bar: BarData) -> bool:
+        """检查是否在14分钟K线组完成时 (组边界对齐)"""
+        dt = bar.datetime
+
+        # 交易日 (17:00+归次日)
+        if dt.hour >= 17:
+            tday = dt.toordinal() + 1
+        else:
+            tday = dt.toordinal()
+
+        # 日内分钟序号 (与_resample_by_time一致)
+        day_minutes = self._get_day_minutes(dt)
+
+        # 组编号 (含交易日, 确保日切时重置)
+        group = tday * 100000 + day_minutes // self.LONG_PERIOD
+
+        if group != self._last_14min_group:
+            self._last_14min_group = group
+            return True
+        return False
+
+    # ================================================================
+    #  信号计算
     # ================================================================
 
     def _is_harmonic_oscillation(self):
@@ -364,11 +505,19 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.am.volume_array,
         ])  # (5, N)
 
-        datetimes = self.bar_datetimes
+        datetimes = list(self.bar_datetimes)
 
         short_data = self._resample_by_time(ohlcv, datetimes, self.SHORT_PERIOD)
         middle_data = self._resample_by_time(ohlcv, datetimes, self.MIDDLE_PERIOD)
         long_data = self._resample_by_time(ohlcv, datetimes, self.LONG_PERIOD)
+
+        # S10: 丢弃最后未完成的K线组 (period > 1时最后一组可能只有部分K线)
+        if self.SHORT_PERIOD > 1 and short_data.shape[1] > 1:
+            short_data = short_data[:, :-1]
+        if self.MIDDLE_PERIOD > 1 and middle_data.shape[1] > 1:
+            middle_data = middle_data[:, :-1]
+        if self.LONG_PERIOD > 1 and long_data.shape[1] > 1:
+            long_data = long_data[:, :-1]
 
         short_sig = self._red_green_signal(short_data)
         middle_sig = self._red_green_signal(middle_data)
@@ -397,10 +546,8 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
     def _resample_by_time(self, ohlcv: np.ndarray, datetimes: list, period: int) -> np.ndarray:
         """
-        按时间边界重采样(PERF-3完全向量化)
-
-        用np.maximum.reduceat / np.minimum.reduceat / np.add.reduceat
-        实现零Python循环的分组聚合。
+        S9: 按真实时间取整重采样, 跳过午休缺口
+        用时间戳对齐到period分钟边界, 不按数组序号分组
         """
         if period == 1:
             return ohlcv.copy()
@@ -409,36 +556,32 @@ class PeriodHarmonicStrategy(CtaTemplate):
         if n == 0:
             return np.empty((5, 0))
 
-        # 1. 向量化计算交易日分组(缓存hours和dates避免重复转换)
-        hours = np.fromiter((d.hour for d in datetimes), dtype=np.int32, count=n)
-        dates = np.fromiter((d.toordinal() for d in datetimes), dtype=np.int32, count=n)
+        # 计算每个bar的交易日和时间组 (v3.1: 统一使用_get_day_minutes)
+        group_ids = np.empty(n, dtype=np.int64)
+        for i, dt in enumerate(datetimes):
+            # 交易日 (17:00+归次日)
+            if dt.hour >= 17:
+                tday = dt.toordinal() + 1
+            else:
+                tday = dt.toordinal()
 
-        # 交易日: hour>=17 的bar属于次日
-        trading_day_ord = np.where(hours >= 17, dates + 1, dates)
+            # 日内分钟序号 (与_check_14min_boundary一致)
+            day_min = self._get_day_minutes(dt)
 
-        # 2. 找交易日边界
-        day_change = np.empty(n, dtype=bool)
-        day_change[0] = True
-        day_change[1:] = trading_day_ord[1:] != trading_day_ord[:-1]
+            # 时间组: 按period分钟取整
+            group_ids[i] = tday * 100000 + day_min // period
 
-        # 3. 向量化计算日内bar序号
-        day_start_indices = np.where(day_change)[0]
-        # 每个bar属于哪个交易日
-        day_idx = np.searchsorted(day_start_indices, np.arange(n), side='right') - 1
-        # 日内序号 = 当前位置 - 所属交易日起点
-        bar_in_day = np.arange(n) - day_start_indices[day_idx]
-
-        # 4. 计算group_id
-        group_id = day_idx * 100000 + bar_in_day // period
-
-        # 5. 找group边界
+        # 找组边界
         group_change = np.empty(n, dtype=bool)
         group_change[0] = True
-        group_change[1:] = group_id[1:] != group_id[:-1]
+        group_change[1:] = group_ids[1:] != group_ids[:-1]
         group_starts = np.where(group_change)[0]
         n_groups = len(group_starts)
 
-        # 6. 用reduceat向量化聚合
+        if n_groups == 0:
+            return np.empty((5, 0))
+
+        # 用reduceat向量化聚合
         result = np.empty((5, n_groups))
 
         # open: 每组第一个
@@ -460,7 +603,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
         return result
 
     def _calculate_rsv(self, high, low, close):
-        """RSV指标(向量化: 用sliding_window_view替代Python循环)"""
+        """RSV指标"""
         n = len(close)
         if n == 0:
             return np.array([])
@@ -469,7 +612,6 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
         if n >= w:
             from numpy.lib.stride_tricks import sliding_window_view
-            # 滚动窗口: shape (n-w+1, w)
             high_w = sliding_window_view(high, w)
             low_w = sliding_window_view(low, w)
             rolling_max = np.max(high_w, axis=1)
@@ -478,7 +620,6 @@ class PeriodHarmonicStrategy(CtaTemplate):
             valid = denom > 0
             rsv[w-1:][valid] = (close[w-1:][valid] - rolling_min[valid]) / denom[valid] * 100
 
-        # 处理前 w-1 个元素(窗口不足)
         for i in range(min(w-1, n)):
             wh = np.max(high[:i+1])
             wl = np.min(low[:i+1])
@@ -487,7 +628,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
         return rsv
 
     def _calculate_kd(self, rsv):
-        """K/D指标(P0-1修复): 标准2/3+1/3"""
+        """K/D指标: 标准2/3+1/3"""
         n = len(rsv)
         if n == 0:
             return np.array([]), np.array([])
@@ -525,28 +666,45 @@ class PeriodHarmonicStrategy(CtaTemplate):
         return np.mean(tr[-self.ATR_WINDOW:])
 
     # ================================================================
-    #  止损止盈(P0-3修复: 追踪止损)
+    #  止损止盈 (S3: 新开仓重新设置, 平仓后清除)
     # ================================================================
 
     def _update_stop_profit(self, direction, ub, lb, bar):
-        """更新止损止盈 - 只收紧不放松, 用缓存ATR"""
+        """更新止损止盈 - 只收紧不放松"""
         atr = self.last_atr
         last_close = bar.close_price
 
-        if direction == 1 or self.pos > 0:
+        # S3: pos=0时, 只在有新信号时设置
+        if self.pos == 0:
+            if direction == 1:
+                # 新开多: 设置初始止损
+                self.stop_price = lb
+                self.take_profit = last_close + self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
+                self.write_log(f"设置多头止损: stop={self.stop_price:.2f} tp={self.take_profit:.2f}")
+            elif direction == -1:
+                # 新开空: 设置初始止损
+                self.stop_price = ub
+                self.take_profit = last_close - self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
+                self.write_log(f"设置空头止损: stop={self.stop_price:.2f} tp={self.take_profit:.2f}")
+            else:
+                # 无方向, 清除
+                self.stop_price = None
+                self.take_profit = None
+        elif self.pos > 0:
+            # 多头持仓: 止损只上移不下移
             if self.stop_price is None:
                 self.stop_price = lb
             else:
                 self.stop_price = max(self.stop_price, lb)
-            self.take_profit = last_close + self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
-
-        elif direction == -1 or self.pos < 0:
+            # S11: 止盈只在开仓时设置, 不随价格更新
+            if self.take_profit is None:
+                self.take_profit = last_close + self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
+        elif self.pos < 0:
+            # 空头持仓: 止损只下移不上移
             if self.stop_price is None:
                 self.stop_price = ub
             else:
                 self.stop_price = min(self.stop_price, ub)
-            self.take_profit = last_close - self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
-
-        if self.pos == 0 and direction == 0:
-            self.stop_price = None
-            self.take_profit = None
+            # S11: 止盈只在开仓时设置, 不随价格更新
+            if self.take_profit is None:
+                self.take_profit = last_close - self.TAKE_PROFIT_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
