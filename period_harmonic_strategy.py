@@ -1,5 +1,5 @@
 """
-vnpy CTA 策略: 周期谐波震荡策略 (Period Harmonic Oscillation) v3.2
+vnpy CTA 策略: 周期谐波震荡策略 (Period Harmonic Oscillation) v3.3
 
 v3.2 全面重构 (基于 Codex 第三轮审查):
   三周期分层共振: 14分钟定趋势, 4分钟确认, 1分钟触发入场
@@ -16,8 +16,10 @@ v3.2 全面重构 (基于 Codex 第三轮审查):
   S11: 止盈改为开仓时固定, 不随价格更新
   S12: 限价单超时2根K线自动撤单
   S13: 14分钟反转平仓优先于风控检查, 不被暂停/亏损拦截
-  S14: 4min/14min信号缓存, 仅在边界时重算(性能优化)
+  S14: KD/ATR按新K线增量更新, 不再每分钟重算整个历史窗口
   S15: backtest_hsi.py用Direction/Offset枚举, 修复语法错误
+  S16: 开仓/退出委托分别追踪, 支持部分成交和退出超时重试
+  S17: 保护单数量随实际持仓同步
 """
 
 from datetime import datetime, timedelta
@@ -40,7 +42,7 @@ from vnpy.trader.constant import Direction, Offset, Status
 
 
 class PeriodHarmonicStrategy(CtaTemplate):
-    """周期谐波震荡策略 - vnpy CTA版本 v3.2"""
+    """周期谐波震荡策略 - vnpy CTA版本 v3.3"""
 
     # ============ 策略参数 ============
     SHORT_PERIOD: int = 1
@@ -126,16 +128,24 @@ class PeriodHarmonicStrategy(CtaTemplate):
         self._last_4min_group: int = -1
         self._last_14min_group: int = -1
 
-        # S14: 信号缓存 (4min/14min只在边界时重算)
-        self._cached_4min_signal: int = 0
-        self._cached_14min_signal: int = 0
+        # S14: 增量KD/ATR状态
+        self._indicator_inited: bool = False
+        self._period_states: dict = {}
+        self._atr_values: deque = deque(maxlen=self.ATR_WINDOW)
+        self._previous_close: Optional[float] = None
 
         # 订单ID追踪
         self.stop_orderid: str = ""
         self.tp_orderid: str = ""
-        self.entry_orderid: str = ""
-        self.order_placed_bar: int = 0
-        self.active_order_ids: set = set()
+        self.entry_orderids: set = set()
+        self.exit_orderids: set = set()
+        self.entry_order_placed_bar: int = 0
+        self.exit_order_placed_bar: int = 0
+        self.force_exit_reason: str = ""
+        self.protected_volume: int = 0
+        self.protection_sync_pending: bool = False
+        self.stop_replace_pending: bool = False
+        self.protection_cancel_ids: set = set()
 
         self._day_just_changed: bool = False
 
@@ -144,18 +154,18 @@ class PeriodHarmonicStrategy(CtaTemplate):
     # ================================================================
 
     def on_init(self):
-        self.write_log("策略初始化 PeriodHarmonicStrategy v3.2")
+        self.write_log("策略初始化 PeriodHarmonicStrategy v3.3")
         try:
             self.load_bar(10)
         except Exception as e:
             self.write_log(f"load_bar异常(非致命): {e}")
 
     def on_start(self):
-        self.write_log("策略启动 v3.2")
+        self.write_log("策略启动 v3.3")
         self.put_event()
 
     def on_stop(self):
-        self.write_log("策略停止 v3.2")
+        self.write_log("策略停止 v3.3")
         self.put_event()
 
     def on_tick(self, tick: TickData):
@@ -178,19 +188,28 @@ class PeriodHarmonicStrategy(CtaTemplate):
         if self.bar_count == 1:
             self.write_log(f"ArrayManager就绪! count={self.am.count} 开始处理信号")
 
-        # S12: 开仓单超时检查 (2根K线未成交则撤单)
-        if self.order_pending and self.entry_orderid:
-            if self.bar_count - self.order_placed_bar >= 2:
-                self.write_log(f"开仓单超时撤单: bar_count={self.bar_count} placed={self.order_placed_bar}")
-                self.cancel_order(self.entry_orderid)
-                self.entry_orderid = ""
-                self.order_pending = False
+        # S12/S16: 开仓和强制退出委托都做超时管理
+        if self.entry_orderids and self.bar_count - self.entry_order_placed_bar >= 2:
+            self.write_log(
+                f"开仓单超时撤单: bar_count={self.bar_count} "
+                f"placed={self.entry_order_placed_bar}"
+            )
+            for vt_orderid in list(self.entry_orderids):
+                self.cancel_order(vt_orderid)
+
+        if self.exit_orderids and self.bar_count - self.exit_order_placed_bar >= 2:
+            self.write_log(
+                f"退出单超时撤单并重试: bar_count={self.bar_count} "
+                f"placed={self.exit_order_placed_bar}"
+            )
+            for vt_orderid in list(self.exit_orderids):
+                self.cancel_order(vt_orderid)
+
+        self._refresh_order_pending()
 
         # 1. 持仓变化检测
         if self.pos != self.last_pos:
-            self.order_pending = False
             self.last_pos = self.pos
-            self.active_order_ids.clear()
 
             if self.pos == 0:
                 # S3: 仓位归零, 清除止损止盈, 撤销所有残留订单
@@ -198,13 +217,16 @@ class PeriodHarmonicStrategy(CtaTemplate):
                 self.take_profit = None
                 self.entry_price = None
                 self.entry_volume = 0
-                self.stop_orderid = ""
-                self.tp_orderid = ""
+                self.protected_volume = 0
+                self.protection_sync_pending = False
+                self.stop_replace_pending = False
+                self.force_exit_reason = ""
+                self._cancel_protective_orders()
                 self.cancel_all()
+                self._refresh_order_pending()
                 self.write_log(f"仓位归零, 清除止损止盈 pos=0 bar_count={self.bar_count}")
             elif self.pos != 0 and self.stop_price is not None:
-                # S4: 开仓成交后预挂止损止盈单
-                self._place_stop_profit_orders(bar)
+                self._request_protection_sync()
 
         # 2. 交易日切换
         self._check_day_rollover(bar)
@@ -215,30 +237,33 @@ class PeriodHarmonicStrategy(CtaTemplate):
                 self.write_log(f"日切: long_dir={self.long_direction} mid_dir={self.middle_direction}")
             self.prev_short_direction = 0
 
+        # 指标始终连续更新, 包括暂停和强制退出期间。
+        self._update_signals(bar)
+        self._try_place_protective_orders()
+        self._try_replace_stop_order()
+
         # 3. 连亏暂停触发 (只设倒计时, 不return)
         if self.loss_num >= self.LOSS_CHANCE:
             self.pausing_countdown = self.PAUSING_PERIOD * self.LONG_PERIOD
             self.loss_num = 0
             self.write_log(f"连亏暂停 {self.pausing_countdown} 根K线")
 
-        # 4. 定时平仓 (优先于一切风控, 确保收盘前能平掉)
+        # 未完成的强制退出优先重试, 不允许仓位失去退出追踪
+        if self.force_exit_reason and self.pos != 0:
+            if not self.exit_orderids:
+                self._submit_forced_exit(bar, self.force_exit_reason)
+            self.put_event()
+            return
+
+        # 4. 定时平仓 (提前一根K线发单, 让最后一根K线完成撮合)
         current_minute = bar.datetime.hour * 60 + bar.datetime.minute
-        is_close_time = (
-            abs(current_minute - self.CLOSE_TIME_1) <= 1 or
-            abs(current_minute - self.CLOSE_TIME_2) <= 1
-        )
+        scheduled_exit_minutes = (self.CLOSE_TIME_1 - 2, self.CLOSE_TIME_2 - 1)
+        is_close_time = current_minute in scheduled_exit_minutes
 
         if is_close_time:
             if self.pos != 0:
                 self.write_log(f"定时平仓: {bar.datetime} pos={self.pos}")
-                self.cancel_all()
-                if self.pos > 0:
-                    sell_price = bar.close_price - self.FIXED_SLIPPAGE
-                    self.sell(sell_price, abs(self.pos))
-                elif self.pos < 0:
-                    buy_price = bar.close_price + self.FIXED_SLIPPAGE
-                    self.cover(buy_price, abs(self.pos))
-                self.order_pending = True
+                self._submit_forced_exit(bar, "scheduled")
             self.put_event()
             return
 
@@ -248,11 +273,7 @@ class PeriodHarmonicStrategy(CtaTemplate):
             abs(current_minute - self.CLOSE_TIME_2) <= self.CLOSE_GUARD_WINDOW
         )
 
-        # 5. 信号计算 (分层更新) - 在风控检查之前, 因为14分钟反转需要信号
-        if not in_close_guard:
-            self._update_signals(bar)
-
-        # 6. 更新止损止盈 (S11: 止盈只在开仓时设置)
+        # 5. 更新止损止盈 (S11: 止盈只在开仓时设置)
         # 止损预挂单模式下, 止损上移时更新停止单
         if self.pos != 0 and self.stop_price is not None:
             self._update_trailing_stop(bar)
@@ -260,19 +281,13 @@ class PeriodHarmonicStrategy(CtaTemplate):
         # 7a. 14分钟反转平仓 (优先于暂停/亏损/order_pending, 确保持仓能退出)
         if self.pos > 0 and self.long_direction == -1:
             self.write_log(f"14分钟转空, 平多仓 close={bar.close_price} bar_count={self.bar_count}")
-            self.cancel_all()
-            self.sell(bar.close_price - self.FIXED_SLIPPAGE, abs(self.pos))
-            if self.trading:
-                self.order_pending = True
+            self._submit_forced_exit(bar, "14m_reversal")
             self.put_event()
             return
 
         elif self.pos < 0 and self.long_direction == 1:
             self.write_log(f"14分钟转多, 平空仓 close={bar.close_price} bar_count={self.bar_count}")
-            self.cancel_all()
-            self.cover(bar.close_price + self.FIXED_SLIPPAGE, abs(self.pos))
-            if self.trading:
-                self.order_pending = True
+            self._submit_forced_exit(bar, "14m_reversal")
             self.put_event()
             return
 
@@ -319,10 +334,9 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.prev_direction = 1
             ids = self.buy(bar.close_price, self.MAX_POSITION)
             if self.trading and ids:
-                self.order_pending = True
-                self.entry_orderid = ids[0]
-                self.order_placed_bar = self.bar_count
-                self.active_order_ids.update(ids)
+                self.entry_orderids.update(ids)
+                self.entry_order_placed_bar = self.bar_count
+                self._refresh_order_pending()
 
         elif entry_signal == -1 and self.pos == 0:
             self.write_log(
@@ -336,29 +350,45 @@ class PeriodHarmonicStrategy(CtaTemplate):
             self.prev_direction = -1
             ids = self.short(bar.close_price, self.MAX_POSITION)
             if self.trading and ids:
-                self.order_pending = True
-                self.entry_orderid = ids[0]
-                self.order_placed_bar = self.bar_count
-                self.active_order_ids.update(ids)
+                self.entry_orderids.update(ids)
+                self.entry_order_placed_bar = self.bar_count
+                self._refresh_order_pending()
 
         self.put_event()
 
     def on_order(self, order: OrderData):
-        """S2: 处理订单状态变化"""
-        # 使用枚举比较
-        if order.status == Status.REJECTED:
-            self.write_log(f"订单被拒绝: {order.vt_orderid} 价格={order.price}")
-            self.order_pending = False
-            self.entry_orderid = ""
-        elif order.status == Status.CANCELLED:
-            self.write_log(f"订单被撤销: {order.vt_orderid}")
-            if order.vt_orderid == self.entry_orderid:
-                self.order_pending = False
-                self.entry_orderid = ""
+        """处理限价委托状态, 保留部分成交委托的追踪。"""
+        order_id = order.vt_orderid
 
-        # 非活跃订单从追踪集合移除
+        if order.status == Status.REJECTED:
+            self.write_log(f"订单被拒绝: {order_id} 价格={order.price}")
+
+        elif order.status == Status.CANCELLED:
+            self.write_log(f"订单被撤销: {order_id}")
+
         if not order.is_active():
-            self.active_order_ids.discard(order.vt_orderid)
+            self.entry_orderids.discard(order_id)
+            self.exit_orderids.discard(order_id)
+            self.protection_cancel_ids.discard(order_id)
+
+        # 止盈是普通限价单, 全成后撤销止损单。
+        if order.status == Status.ALLTRADED and order_id == self.tp_orderid:
+            self.tp_orderid = ""
+            self.protection_sync_pending = False
+            self.stop_replace_pending = False
+            if self.stop_orderid:
+                stop_orderid = self.stop_orderid
+                self.stop_orderid = ""
+                self.cancel_order(stop_orderid)
+        elif not order.is_active() and order_id == self.tp_orderid:
+            self.tp_orderid = ""
+            if order.status == Status.REJECTED and self.pos != 0 and not self.force_exit_reason:
+                self.protection_sync_pending = True
+
+        self._try_place_protective_orders()
+        self._try_replace_stop_order()
+
+        self._refresh_order_pending()
 
         self.put_event()
 
@@ -381,9 +411,15 @@ class PeriodHarmonicStrategy(CtaTemplate):
             else:
                 self.entry_price = trade.price
                 self.entry_volume = trade.volume
-            self.entry_orderid = ""
+            # 委托ID在on_order中按成交状态移除。这里不清空集合,
+            # 这样部分成交的剩余数量仍会继续被超时检查。
+            self._request_protection_sync()
 
         elif is_close and self.entry_price is not None and self.prev_direction != 0:
+            # 一旦开始平仓, 立即撤销尚未成交的开仓余单，防止保护单成交后又被补回仓位。
+            for vt_orderid in list(self.entry_orderids):
+                self.cancel_order(vt_orderid)
+
             # 平仓成交: 计算本次平仓部分盈亏
             pnl = self._calc_pnl_full(self.entry_price, trade.price, self.prev_direction, trade.volume)
 
@@ -404,6 +440,11 @@ class PeriodHarmonicStrategy(CtaTemplate):
             # S4: 平仓成交时撤销另一侧订单
             self._cancel_opposite_orders(trade)
 
+            if self.pos == 0:
+                self.force_exit_reason = ""
+
+        self._refresh_order_pending()
+
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder):
@@ -411,16 +452,33 @@ class PeriodHarmonicStrategy(CtaTemplate):
         # vn.py 4.4 StopOrder 属性是 stop_orderid, 不是 vt_orderid
         if stop_order.status.name == "CANCELLED":
             self.write_log(f"停止单被撤销")
-            if stop_order.stop_orderid == self.stop_orderid:
+            was_expected = stop_order.stop_orderid in self.protection_cancel_ids
+            was_current = stop_order.stop_orderid == self.stop_orderid
+            self.protection_cancel_ids.discard(stop_order.stop_orderid)
+            if was_current:
                 self.stop_orderid = ""
+            if was_current and not was_expected and self.pos != 0 and not self.force_exit_reason:
+                self.stop_replace_pending = True
         elif stop_order.status.name == "TRIGGERED":
             self.write_log(f"停止单已触发, 等待成交")
+            self.protection_cancel_ids.discard(stop_order.stop_orderid)
+            self.protection_sync_pending = False
+            self.stop_replace_pending = False
             if stop_order.stop_orderid == self.stop_orderid:
                 self.stop_orderid = ""
             # 止损触发 → 撤销止盈单
             if self.tp_orderid:
-                self.cancel_order(self.tp_orderid)
+                tp_orderid = self.tp_orderid
                 self.tp_orderid = ""
+                self.cancel_order(tp_orderid)
+
+            # vn.py会把停止单转换成普通平仓单, 这些ID必须纳入退出追踪。
+            self.exit_orderids.update(stop_order.vt_orderids)
+            self.exit_order_placed_bar = self.bar_count
+
+        self._try_place_protective_orders()
+        self._try_replace_stop_order()
+        self._refresh_order_pending()
 
         self.put_event()
 
@@ -454,104 +512,233 @@ class PeriodHarmonicStrategy(CtaTemplate):
     # ================================================================
 
     def _update_signals(self, bar: BarData):
-        """分层更新三个周期方向 (S14: 4min/14min仅在边界时重算)"""
+        """逐根更新1分钟信号, 仅在完整周期结束后更新4/14分钟信号。"""
+        if not self._indicator_inited:
+            self._bootstrap_indicators()
+            return
 
-        # 1分钟信号每根bar更新 (数据量小, 直接算)
-        new_short = self._calc_signal_for_period(self.SHORT_PERIOD)
         self.prev_short_direction = self.short_direction
-        self.short_direction = new_short
+        self.short_direction, _ = self._advance_period(bar, self.SHORT_PERIOD)
 
-        # 4分钟信号: 仅在组边界时重算, 否则用缓存
-        if self._check_period_boundary(bar, self.MIDDLE_PERIOD):
-            new_middle = self._calc_signal_for_period(self.MIDDLE_PERIOD)
-            self._cached_4min_signal = new_middle
-            if new_middle != self.middle_direction:
-                self.write_log(
-                    f"4分钟信号更新: {self.middle_direction}→{new_middle} bar_count={self.bar_count}"
-                )
-            self.middle_direction = new_middle
-        else:
-            self.middle_direction = self._cached_4min_signal
+        new_middle, middle_updated = self._advance_period(bar, self.MIDDLE_PERIOD)
+        if middle_updated and new_middle != self.middle_direction:
+            self.write_log(
+                f"4分钟信号更新: {self.middle_direction}→{new_middle} bar_count={self.bar_count}"
+            )
+        self.middle_direction = new_middle
 
-        # 14分钟信号: 仅在组边界时重算, 否则用缓存
-        if self._check_period_boundary(bar, self.LONG_PERIOD):
-            new_long = self._calc_signal_for_period(self.LONG_PERIOD)
-            self._cached_14min_signal = new_long
-            if new_long != self.long_direction:
-                self.write_log(
-                    f"14分钟信号更新: {self.long_direction}→{new_long} bar_count={self.bar_count}"
-                )
-            self.long_direction = new_long
-        else:
-            self.long_direction = self._cached_14min_signal
+        new_long, long_updated = self._advance_period(bar, self.LONG_PERIOD)
+        if long_updated and new_long != self.long_direction:
+            self.write_log(
+                f"14分钟信号更新: {self.long_direction}→{new_long} bar_count={self.bar_count}"
+            )
+        self.long_direction = new_long
 
-        # 更新ATR (每根bar更新, 计算量小)
-        ohlcv_2d = np.array([
-            self.am.open_array,
-            self.am.high_array,
-            self.am.low_array,
-            self.am.close_array,
-            self.am.volume_array,
-        ]).T
-        self.last_atr = self._calculate_atr(ohlcv_2d)
+        self._advance_atr(bar)
 
-    def _calc_signal_for_period(self, period: int) -> int:
-        """计算指定周期的KD信号: +1=多, 0=中性, -1=空"""
+    def _bootstrap_indicators(self):
+        """用ArrayManager中的预热数据初始化一次, 后续全部增量计算。"""
         ohlcv = np.array([
             self.am.open_array,
             self.am.high_array,
             self.am.low_array,
             self.am.close_array,
             self.am.volume_array,
-        ])  # (5, N)
+        ])
         datetimes = list(self.bar_datetimes)
 
-        resampled = self._resample_by_time(ohlcv, datetimes, period)
-        return self._red_green_signal(resampled)
+        for period in (self.SHORT_PERIOD, self.MIDDLE_PERIOD, self.LONG_PERIOD):
+            state = self._new_period_state()
+            completed = self._resample_by_time(ohlcv, datetimes, period)
+            for i in range(completed.shape[1]):
+                self._advance_kd_state(
+                    state,
+                    completed[1, i],
+                    completed[2, i],
+                    completed[3, i],
+                )
+
+            if period > 1 and datetimes:
+                latest_key = self._get_period_key(datetimes[-1], period)
+                tail_start = len(datetimes) - 1
+                while (
+                    tail_start > 0
+                    and self._get_period_key(datetimes[tail_start - 1], period) == latest_key
+                ):
+                    tail_start -= 1
+                tail_count = len(datetimes) - tail_start
+                if latest_key is not None and tail_count < period:
+                    state["current_key"] = latest_key
+                    state["current_count"] = tail_count
+                    state["current_open"] = float(ohlcv[0, tail_start])
+                    state["current_high"] = float(np.max(ohlcv[1, tail_start:]))
+                    state["current_low"] = float(np.min(ohlcv[2, tail_start:]))
+                    state["current_close"] = float(ohlcv[3, -1])
+                    state["current_volume"] = float(np.sum(ohlcv[4, tail_start:]))
+
+            self._period_states[period] = state
+
+        self.short_direction = self._signal_from_state(self._period_states[self.SHORT_PERIOD])
+        self.middle_direction = self._signal_from_state(self._period_states[self.MIDDLE_PERIOD])
+        self.long_direction = self._signal_from_state(self._period_states[self.LONG_PERIOD])
+
+        highs = self.am.high_array
+        lows = self.am.low_array
+        closes = self.am.close_array
+        start = max(1, len(closes) - self.ATR_WINDOW)
+        for i in range(start, len(closes)):
+            previous_close = closes[i - 1]
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - previous_close),
+                abs(lows[i] - previous_close),
+            )
+            self._atr_values.append(float(tr))
+        if self._atr_values:
+            self.last_atr = float(np.mean(self._atr_values))
+        self._previous_close = float(closes[-1])
+        self._indicator_inited = True
+
+    def _new_period_state(self) -> dict:
+        return {
+            "highs": deque(maxlen=self.RSV_WINDOW),
+            "lows": deque(maxlen=self.RSV_WINDOW),
+            "k": None,
+            "d": None,
+            "count": 0,
+            "signal": 0,
+            "current_key": None,
+            "current_count": 0,
+            "current_open": 0.0,
+            "current_high": 0.0,
+            "current_low": 0.0,
+            "current_close": 0.0,
+            "current_volume": 0.0,
+        }
+
+    def _advance_kd_state(self, state: dict, high: float, low: float, close: float) -> int:
+        state["highs"].append(float(high))
+        state["lows"].append(float(low))
+
+        highest = max(state["highs"])
+        lowest = min(state["lows"])
+        rsv = 50.0 if highest == lowest else (float(close) - lowest) / (highest - lowest) * 100
+
+        if state["k"] is None:
+            state["k"] = rsv
+            state["d"] = rsv
+        else:
+            state["k"] = (2.0 / 3.0) * state["k"] + (1.0 / 3.0) * rsv
+            state["d"] = (2.0 / 3.0) * state["d"] + (1.0 / 3.0) * state["k"]
+
+        state["count"] += 1
+        state["signal"] = self._signal_from_state(state)
+        return state["signal"]
+
+    def _signal_from_state(self, state: dict) -> int:
+        if state["count"] < self.RSV_WINDOW or state["k"] is None:
+            return 0
+        if state["k"] >= self.RED_THRESHOLD and state["k"] >= state["d"]:
+            return 1
+        if state["k"] <= self.GREEN_THRESHOLD and state["k"] <= state["d"]:
+            return -1
+        return 0
+
+    def _advance_period(self, bar: BarData, period: int):
+        state = self._period_states[period]
+        if period == 1:
+            signal = self._advance_kd_state(
+                state, bar.high_price, bar.low_price, bar.close_price
+            )
+            return signal, True
+
+        key = self._get_period_key(bar.datetime, period)
+        if key is None:
+            return state["signal"], False
+
+        if state["current_key"] is None:
+            self._start_period_bar(state, key, bar)
+            return state["signal"], False
+
+        if key == state["current_key"]:
+            state["current_count"] += 1
+            state["current_high"] = max(state["current_high"], bar.high_price)
+            state["current_low"] = min(state["current_low"], bar.low_price)
+            state["current_close"] = bar.close_price
+            state["current_volume"] += bar.volume
+            return state["signal"], False
+
+        updated = False
+        if state["current_count"] >= period:
+            self._advance_kd_state(
+                state,
+                state["current_high"],
+                state["current_low"],
+                state["current_close"],
+            )
+            updated = True
+
+        self._start_period_bar(state, key, bar)
+        return state["signal"], updated
+
+    @staticmethod
+    def _start_period_bar(state: dict, key: int, bar: BarData):
+        state["current_key"] = key
+        state["current_count"] = 1
+        state["current_open"] = bar.open_price
+        state["current_high"] = bar.high_price
+        state["current_low"] = bar.low_price
+        state["current_close"] = bar.close_price
+        state["current_volume"] = bar.volume
+
+    def _advance_atr(self, bar: BarData):
+        previous_close = self._previous_close
+        if previous_close is None:
+            tr = bar.high_price - bar.low_price
+        else:
+            tr = max(
+                bar.high_price - bar.low_price,
+                abs(bar.high_price - previous_close),
+                abs(bar.low_price - previous_close),
+            )
+        self._atr_values.append(float(tr))
+        self.last_atr = float(np.mean(self._atr_values))
+        self._previous_close = bar.close_price
 
     # ================================================================
     #  时间与重采样
     # ================================================================
 
     def _get_day_minutes(self, dt: datetime) -> int:
-        """计算交易时段内分钟序号 (按09:15/13:00/17:15分别零点)"""
-        h, m = dt.hour, dt.minute
+        """兼容辅助方法: 返回各交易时段内从零开始的分钟数。"""
+        session_position = self._get_session_position(dt)
+        return -1 if session_position is None else session_position[1]
 
-        # 夜盘: 17:15 - 次日02:59 (17:15为零点)
-        if h >= 17:
-            return (h - 17) * 60 + (m - 15)
-        elif h < 5:
-            # 次日凌晨, 继续夜盘序号
-            # 17:15到23:59 = 404分钟, 00:00继续
-            return 404 + h * 60 + m + 1   # 404 = (23-17)*60 + (59-15) + 1
-        # 上午盘: 09:15 - 11:59 (09:15为零点)
-        elif h >= 9 and h < 12:
-            return (h - 9) * 60 + (m - 15)
-        # 下午盘: 13:00 - 16:29 (13:00为零点, 加10000与上午区分)
-        elif h >= 13 and h < 17:
-            return 10000 + (h - 13) * 60 + m
-        else:
-            # 05:00-08:59 或 12:00-12:59 (午休)
-            return -1  # 无效时段
+    def _get_session_position(self, dt: datetime):
+        h, m = dt.hour, dt.minute
+        if h > 17 or (h == 17 and m >= 15):
+            return 0, (h - 17) * 60 + m - 15
+        if h < 3:
+            return 0, 405 + h * 60 + m
+        if (h == 9 and m >= 15) or 10 <= h < 12:
+            return 1, (h - 9) * 60 + m - 15
+        if 13 <= h < 17:
+            return 2, (h - 13) * 60 + m
+        return None
+
+    def _get_period_key(self, dt: datetime, period: int):
+        session_position = self._get_session_position(dt)
+        if session_position is None:
+            return None
+        session, session_minute = session_position
+        trading_day = dt.toordinal() + 1 if dt.hour >= 17 else dt.toordinal()
+        return trading_day * 10_000_000 + session * 1_000_000 + session_minute // period
 
     def _check_period_boundary(self, bar: BarData, period: int) -> bool:
         """检查是否在指定周期K线组完成时"""
-        dt = bar.datetime
-
-        # 交易日 (17:00+归次日)
-        if dt.hour >= 17:
-            tday = dt.toordinal() + 1
-        else:
-            tday = dt.toordinal()
-
-        day_minutes = self._get_day_minutes(dt)
-        if day_minutes < 0:
-            return False  # 无效时段
-
-        # 按时段+交易日+组编号生成唯一key
-        session = day_minutes // 10000  # 0=夜盘, 0=上午, 1=下午
-        session_minutes = day_minutes % 10000 if session >= 1 else day_minutes
-        group = tday * 1000000 + session * 100000 + session_minutes // period
+        group = self._get_period_key(bar.datetime, period)
+        if group is None:
+            return False
 
         if period == self.MIDDLE_PERIOD:
             if group != self._last_4min_group:
@@ -578,18 +765,9 @@ class PeriodHarmonicStrategy(CtaTemplate):
         # 计算每个bar的交易日+时段+组编号
         group_ids = np.empty(n, dtype=np.int64)
         for i, dt in enumerate(datetimes):
-            if dt.hour >= 17:
-                tday = dt.toordinal() + 1
-            else:
-                tday = dt.toordinal()
-            day_min = self._get_day_minutes(dt)
-            if day_min < 0:
-                # 无效时段: 赋一个唯一的大值, 使其自成一组(之后会被丢弃)
-                group_ids[i] = -1
-                continue
-            session = day_min // 10000
-            session_minutes = day_min % 10000 if session >= 1 else day_min
-            group_ids[i] = tday * 1000000 + session * 100000 + session_minutes // period
+            key = self._get_period_key(dt, period)
+            # 无效时间各自成组, 防止连续无效bar被误聚合成完整K线。
+            group_ids[i] = key if key is not None else -(i + 1)
 
         # 找组边界
         group_change = np.empty(n, dtype=bool)
@@ -617,103 +795,132 @@ class PeriodHarmonicStrategy(CtaTemplate):
 
         return result
 
-    def _calculate_rsv(self, high, low, close):
-        """RSV指标"""
-        n = len(close)
-        if n == 0:
-            return np.array([])
-        rsv = np.full(n, 50.0)
-        w = self.RSV_WINDOW
-
-        if n >= w:
-            from numpy.lib.stride_tricks import sliding_window_view
-            high_w = sliding_window_view(high, w)
-            low_w = sliding_window_view(low, w)
-            rolling_max = np.max(high_w, axis=1)
-            rolling_min = np.min(low_w, axis=1)
-            denom = rolling_max - rolling_min
-            valid = denom > 0
-            rsv[w-1:][valid] = (close[w-1:][valid] - rolling_min[valid]) / denom[valid] * 100
-
-        for i in range(min(w-1, n)):
-            wh = np.max(high[:i+1])
-            wl = np.min(low[:i+1])
-            if wh - wl > 0:
-                rsv[i] = (close[i] - wl) / (wh - wl) * 100
-        return rsv
-
-    def _calculate_kd(self, rsv):
-        """K/D指标: 标准2/3+1/3"""
-        n = len(rsv)
-        if n == 0:
-            return np.array([]), np.array([])
-        k = np.empty(n)
-        d = np.empty(n)
-        k[0] = rsv[0]
-        d[0] = k[0]
-        for i in range(1, n):
-            k[i] = (2.0/3.0) * k[i-1] + (1.0/3.0) * rsv[i]
-            d[i] = (2.0/3.0) * d[i-1] + (1.0/3.0) * k[i]
-        return k, d
-
-    def _red_green_signal(self, ohlcv):
-        """KD信号: +1=多头(动量延续), 0=中性, -1=空头"""
-        if ohlcv.shape[1] < self.RSV_WINDOW:
-            return 0
-        rsv = self._calculate_rsv(ohlcv[1, :], ohlcv[2, :], ohlcv[3, :])
-        k, d = self._calculate_kd(rsv)
-        lk, ld = k[-1], d[-1]
-        if lk >= self.RED_THRESHOLD and lk >= ld:
-            return 1    # 多头
-        if lk <= self.GREEN_THRESHOLD and lk <= ld:
-            return -1   # 空头
-        return 0        # 中性
-
-    def _calculate_atr(self, ohlcv_2d):
-        """ATR"""
-        if len(ohlcv_2d) < self.ATR_WINDOW + 1:
-            return 10.0
-        high = ohlcv_2d[:, 1]
-        low = ohlcv_2d[:, 2]
-        close_prev = np.roll(ohlcv_2d[:, 3], 1)
-        close_prev[0] = close_prev[1]
-        tr = np.maximum(np.maximum(high - low, np.abs(high - close_prev)), np.abs(low - close_prev))
-        return np.mean(tr[-self.ATR_WINDOW:])
-
     # ================================================================
     #  止损止盈预挂单
     # ================================================================
 
-    def _place_stop_profit_orders(self, bar: BarData):
-        """S4: 开仓成交后预挂止损止盈单"""
-        vol = abs(self.pos)
-        if vol == 0:
+    def _refresh_order_pending(self):
+        self.order_pending = bool(self.entry_orderids or self.exit_orderids)
+
+    def _submit_forced_exit(self, bar: BarData, reason: str):
+        """撤销开仓/保护委托并提交可追踪的强制退出单。"""
+        self.force_exit_reason = reason
+        self.protection_sync_pending = False
+        self.stop_replace_pending = False
+
+        for vt_orderid in list(self.entry_orderids):
+            self.cancel_order(vt_orderid)
+
+        self._cancel_protective_orders()
+
+        # 实盘撤单是异步的。等撤单回报到齐后, 下一根bar再提交退出单。
+        if self.entry_orderids or self.stop_orderid or self.tp_orderid or self.exit_orderids:
+            self._refresh_order_pending()
+            return
+
+        volume = abs(self.pos)
+        if volume == 0:
+            self.force_exit_reason = ""
+            self._refresh_order_pending()
             return
 
         if self.pos > 0:
-            # 多头: 止损卖出(停止单), 止盈卖出(限价单)
-            if self.stop_price is not None and self.stop_orderid == "":
+            ids = self.sell(bar.close_price - self.FIXED_SLIPPAGE, volume)
+        else:
+            ids = self.cover(bar.close_price + self.FIXED_SLIPPAGE, volume)
+
+        if ids:
+            self.exit_orderids.update(ids)
+            self.exit_order_placed_bar = self.bar_count
+            self.write_log(
+                f"提交强制退出单: reason={reason} pos={self.pos} ids={ids}"
+            )
+        self._refresh_order_pending()
+
+    def _cancel_protective_orders(self):
+        ids = [order_id for order_id in (self.stop_orderid, self.tp_orderid) if order_id]
+        self.protection_cancel_ids.update(ids)
+        for order_id in ids:
+            self.cancel_order(order_id)
+
+    def _request_protection_sync(self):
+        """按实际持仓量重建止损/止盈, 用于部分成交和部分平仓。"""
+        if self.pos == 0 or self.force_exit_reason:
+            return
+
+        desired_volume = abs(self.pos)
+        if (
+            desired_volume == self.protected_volume
+            and self.stop_orderid
+            and self.tp_orderid
+            and not self.protection_sync_pending
+        ):
+            return
+
+        self.protection_sync_pending = True
+        self.stop_replace_pending = False
+        self._cancel_protective_orders()
+        self._try_place_protective_orders()
+
+    def _try_place_protective_orders(self):
+        if (
+            not self.protection_sync_pending
+            or self.protection_cancel_ids
+            or self.force_exit_reason
+            or self.pos == 0
+        ):
+            return
+
+        vol = abs(self.pos)
+
+        if self.pos > 0:
+            if self.stop_price is not None and not self.stop_orderid:
                 ids = self.sell(self.stop_price, vol, stop=True)
                 if ids:
                     self.stop_orderid = ids[0]
                     self.write_log(f"预挂多头止损单: stop={self.stop_price:.2f} id={ids[0]}")
-            if self.take_profit is not None and self.tp_orderid == "":
+            if self.take_profit is not None and not self.tp_orderid:
                 ids = self.sell(self.take_profit, vol)
                 if ids:
                     self.tp_orderid = ids[0]
                     self.write_log(f"预挂多头止盈单: tp={self.take_profit:.2f} id={ids[0]}")
-        elif self.pos < 0:
-            # 空头: 止损买入(停止单), 止盈买入(限价单)
-            if self.stop_price is not None and self.stop_orderid == "":
+        else:
+            if self.stop_price is not None and not self.stop_orderid:
                 ids = self.cover(self.stop_price, vol, stop=True)
                 if ids:
                     self.stop_orderid = ids[0]
                     self.write_log(f"预挂空头止损单: stop={self.stop_price:.2f} id={ids[0]}")
-            if self.take_profit is not None and self.tp_orderid == "":
+            if self.take_profit is not None and not self.tp_orderid:
                 ids = self.cover(self.take_profit, vol)
                 if ids:
                     self.tp_orderid = ids[0]
                     self.write_log(f"预挂空头止盈单: tp={self.take_profit:.2f} id={ids[0]}")
+
+        if self.stop_orderid and self.tp_orderid:
+            self.protected_volume = vol
+            self.protection_sync_pending = False
+
+    def _try_replace_stop_order(self):
+        if (
+            not self.stop_replace_pending
+            or self.stop_orderid
+            or self.protection_cancel_ids
+            or self.force_exit_reason
+            or self.pos == 0
+            or self.stop_price is None
+        ):
+            return
+
+        volume = abs(self.pos)
+        if self.pos > 0:
+            ids = self.sell(self.stop_price, volume, stop=True)
+        else:
+            ids = self.cover(self.stop_price, volume, stop=True)
+        if ids:
+            self.stop_orderid = ids[0]
+            self.stop_replace_pending = False
+            self.protected_volume = volume
+            self.write_log(f"移动止损单已更新: stop={self.stop_price:.2f} id={ids[0]}")
 
     def _update_trailing_stop(self, bar: BarData):
         """止损上移时更新停止单 (多头只上移, 空头只下移)"""
@@ -725,57 +932,34 @@ class PeriodHarmonicStrategy(CtaTemplate):
             if self.stop_price is None:
                 self.stop_price = new_stop
             elif new_stop > self.stop_price:
-                # 止损上移: 撤旧单, 挂新单
                 old_stop = self.stop_price
                 self.stop_price = new_stop
+                self.stop_replace_pending = True
                 if self.stop_orderid:
+                    self.protection_cancel_ids.add(self.stop_orderid)
                     self.cancel_order(self.stop_orderid)
-                    self.stop_orderid = ""
-                vol = abs(self.pos)
-                ids = self.sell(new_stop, vol, stop=True)
-                if ids:
-                    self.stop_orderid = ids[0]
-                    self.write_log(f"止损上移: {old_stop:.2f}→{new_stop:.2f} id={ids[0]}")
+                self._try_replace_stop_order()
+                self.write_log(f"止损上移: {old_stop:.2f}→{new_stop:.2f}")
         elif self.pos < 0:
             new_stop = last_close + self.STOP_LOSS_MULTIPLIER * atr * (1 + self.SLIPPAGE_RATIO)
             if self.stop_price is None:
                 self.stop_price = new_stop
             elif new_stop < self.stop_price:
-                # 止损下移: 撤旧单, 挂新单
                 old_stop = self.stop_price
                 self.stop_price = new_stop
+                self.stop_replace_pending = True
                 if self.stop_orderid:
+                    self.protection_cancel_ids.add(self.stop_orderid)
                     self.cancel_order(self.stop_orderid)
-                    self.stop_orderid = ""
-                vol = abs(self.pos)
-                ids = self.cover(new_stop, vol, stop=True)
-                if ids:
-                    self.stop_orderid = ids[0]
-                    self.write_log(f"止损下移: {old_stop:.2f}→{new_stop:.2f} id={ids[0]}")
+                self._try_replace_stop_order()
+                self.write_log(f"止损下移: {old_stop:.2f}→{new_stop:.2f}")
 
     def _cancel_opposite_orders(self, trade: TradeData):
-        """平仓成交时撤销另一侧订单"""
-        # 如果是止损单触发的平仓 → 撤止盈
-        # 如果是止盈单成交的平仓 → 撤止损
-        trade_id = trade.vt_orderid
-
-        if trade_id == self.stop_orderid:
-            # 止损成交 → 撤止盈
-            if self.tp_orderid:
-                self.cancel_order(self.tp_orderid)
-                self.tp_orderid = ""
-            self.stop_orderid = ""
-        elif trade_id == self.tp_orderid:
-            # 止盈成交 → 撤止损
-            if self.stop_orderid:
-                self.cancel_order(self.stop_orderid)
-                self.stop_orderid = ""
-            self.tp_orderid = ""
-        else:
-            # 信号平仓或定时平仓 → 撤所有
-            if self.stop_orderid:
-                self.cancel_order(self.stop_orderid)
-                self.stop_orderid = ""
-            if self.tp_orderid:
-                self.cancel_order(self.tp_orderid)
-                self.tp_orderid = ""
+        """平仓后撤销旧保护单, 剩余仓位按实际数量重新保护。"""
+        self.protected_volume = 0
+        if self.pos == 0:
+            self.protection_sync_pending = False
+            self.stop_replace_pending = False
+            self._cancel_protective_orders()
+        elif not self.force_exit_reason:
+            self._request_protection_sync()

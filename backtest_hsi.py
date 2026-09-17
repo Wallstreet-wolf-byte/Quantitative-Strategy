@@ -15,9 +15,9 @@ vnpy 离线回测启动脚本 - 恒指期货周期谐波震荡策略
     python backtest_hsi.py 2024-01-01 2024-03-31 --csv /path/to/HSI.csv  # 指定CSV
 """
 
-import sys
 import time
 import importlib
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +33,12 @@ from vnpy_ctastrategy.backtesting import BacktestingEngine
 #  配置
 # ================================================================
 
-CSV_PATH = "/workspace/.uploads/e7dd03d5-0a6e-4403-8849-315e2769d79c_HSI.csv"
+CSV_PATH = str(
+    Path(__file__).resolve().parent.parent
+    / "数据"
+    / "HSI_2021-01-01_2026-08-29"
+    / "HSI.csv"
+)
 
 SYMBOL = "HSImain"
 EXCHANGE = Exchange.HKFE
@@ -160,7 +165,26 @@ def _check_data_quality(df: pd.DataFrame):
 #  回测引擎
 # ================================================================
 
-def run_backtest(start: datetime, end: datetime, show_chart: bool = False):
+class ConservativeBacktestingEngine(BacktestingEngine):
+    """同根K线同时触发止损和止盈时, 按止损优先撮合。"""
+
+    def new_bar(self, bar: BarData) -> None:
+        self.bar = bar
+        self.datetime = bar.datetime
+
+        # 标准vn.py先撮合限价止盈, 会在同根K线双触发时产生乐观偏差。
+        self.cross_stop_order()
+        self.cross_limit_order()
+        self.strategy.on_bar(bar)
+        self.update_daily_close(bar.close_price)
+
+
+def run_backtest(
+    start: datetime,
+    end: datetime,
+    show_chart: bool = False,
+    csv_path: str = None,
+):
     """运行完整回测"""
     print("=" * 70)
     print("恒指期货 周期谐波震荡策略 vnpy回测")
@@ -175,13 +199,14 @@ def run_backtest(start: datetime, end: datetime, show_chart: bool = False):
     print("=" * 70)
 
     # 1. 加载数据
-    bars = load_bars_from_csv(CSV_PATH, SYMBOL, EXCHANGE, start, end)
+    data_path = csv_path or CSV_PATH
+    bars = load_bars_from_csv(data_path, SYMBOL, EXCHANGE, start, end)
     if not bars:
         print("无数据, 退出")
         return
 
     # 2. 创建回测引擎
-    engine = BacktestingEngine()
+    engine = ConservativeBacktestingEngine()
     engine.set_parameters(
         vt_symbol=f"{SYMBOL}.{EXCHANGE.value}",
         interval=INTERVAL,
@@ -289,21 +314,27 @@ def _print_trade_analysis(trades: list):
     # 按时间排序
     sorted_trades = sorted(trades, key=lambda t: t.datetime)
 
-    # 配对: 开仓→平仓
+    # FIFO配对: 支持一笔委托分多次成交和分批平仓
     pairs = []
-    open_trade = None
+    open_lots = []
     for t in sorted_trades:
         if t.offset == Offset.OPEN:
-            if open_trade is not None:
-                # 前一个开仓未平, 跳过
-                pass
-            open_trade = t
+            open_lots.append({
+                "trade": t,
+                "remaining": t.volume,
+            })
         elif t.offset in (Offset.CLOSE, Offset.CLOSETODAY, Offset.CLOSEYESTERDAY):
-            if open_trade is not None:
+            close_remaining = t.volume
+            while close_remaining > 0 and open_lots:
+                lot = open_lots[0]
+                open_trade = lot["trade"]
+                matched_volume = min(close_remaining, lot["remaining"])
+
                 if open_trade.direction == Direction.LONG:
-                    pnl = (t.price - open_trade.price) * CONTRACT_SIZE * t.volume
+                    pnl = (t.price - open_trade.price) * CONTRACT_SIZE * matched_volume
                 else:
-                    pnl = (open_trade.price - t.price) * CONTRACT_SIZE * t.volume
+                    pnl = (open_trade.price - t.price) * CONTRACT_SIZE * matched_volume
+
                 pairs.append({
                     "open_time": open_trade.datetime,
                     "close_time": t.datetime,
@@ -311,28 +342,13 @@ def _print_trade_analysis(trades: list):
                     "open_price": open_trade.price,
                     "close_price": t.price,
                     "pnl": pnl,
-                    "volume": t.volume,
+                    "volume": matched_volume,
                 })
-                open_trade = None
-        else:
-            # 反手或未知, 尝试按方向配对
-            if open_trade is None:
-                open_trade = t
-            else:
-                if open_trade.direction == Direction.LONG:
-                    pnl = (t.price - open_trade.price) * CONTRACT_SIZE * t.volume
-                else:
-                    pnl = (open_trade.price - t.price) * CONTRACT_SIZE * t.volume
-                pairs.append({
-                    "open_time": open_trade.datetime,
-                    "close_time": t.datetime,
-                    "direction": str(open_trade.direction),
-                    "open_price": open_trade.price,
-                    "close_price": t.price,
-                    "pnl": pnl,
-                    "volume": t.volume,
-                })
-                open_trade = None
+
+                lot["remaining"] -= matched_volume
+                close_remaining -= matched_volume
+                if lot["remaining"] <= 0:
+                    open_lots.pop(0)
 
     if not pairs:
         print("无法配对成交记录")
@@ -448,32 +464,13 @@ def _print_daily_summary(df_result: pd.DataFrame):
 # ================================================================
 
 if __name__ == "__main__":
-    # 解析命令行参数
-    if len(sys.argv) >= 3:
-        start = datetime.strptime(sys.argv[1], "%Y-%m-%d")
-        end = datetime.strptime(sys.argv[2], "%Y-%m-%d")
-    else:
-        start = DEFAULT_START
-        end = DEFAULT_END
+    parser = argparse.ArgumentParser(description="恒指期货周期谐波策略回测")
+    parser.add_argument("start", nargs="?", default=DEFAULT_START.strftime("%Y-%m-%d"))
+    parser.add_argument("end", nargs="?", default=DEFAULT_END.strftime("%Y-%m-%d"))
+    parser.add_argument("--csv", dest="csv_path", default=None)
+    parser.add_argument("--chart", action="store_true")
+    args = parser.parse_args()
 
-    show_chart = "--chart" in sys.argv
-
-    # 支持 --csv 参数指定数据文件
-    csv_arg = None
-    if "--csv" in sys.argv:
-        idx = sys.argv.index("--csv")
-        if idx + 1 < len(sys.argv):
-            csv_arg = sys.argv[idx + 1]
-
-    if csv_arg:
-        # 直接传参, 不用global (避免SyntaxError)
-        _run_with_csv(csv_arg, start, end, show_chart)
-    else:
-        run_backtest(start, end, show_chart=show_chart)
-
-
-def _run_with_csv(csv_path: str, start: datetime, end: datetime, show_chart: bool):
-    """用指定CSV路径运行回测"""
-    global CSV_PATH
-    CSV_PATH = csv_path
-    run_backtest(start, end, show_chart=show_chart)
+    start = datetime.strptime(args.start, "%Y-%m-%d")
+    end = datetime.strptime(args.end, "%Y-%m-%d")
+    run_backtest(start, end, show_chart=args.chart, csv_path=args.csv_path)
