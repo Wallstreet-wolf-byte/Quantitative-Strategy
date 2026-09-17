@@ -10,8 +10,9 @@ vnpy 离线回测启动脚本 - 恒指期货周期谐波震荡策略
 
 使用方式:
     cd /workspace
-    python backtest_hsi.py                    # 默认回测全量数据
-    python backtest_hsi.py 2024-01-01 2024-03-31  # 指定区间
+    python backtest_hsi.py                                # 默认回测全量数据
+    python backtest_hsi.py 2024-01-01 2024-03-31          # 指定区间
+    python backtest_hsi.py 2024-01-01 2024-03-31 --csv /path/to/HSI.csv  # 指定CSV
 """
 
 import sys
@@ -48,20 +49,15 @@ PRICE_TICK = 1
 COMMISSION_RATE = 0.000047
 SLIPPAGE = 1
 
-# 策略参数
+# 策略参数 (v3.2: 移除已删参数 SIGNAL_THRESH/LONG_WEIGHT/MIDDLE_WEIGHT/SHORT_WEIGHT/SCORE_OFFSET)
 STRATEGY_SETTING = {
     "SHORT_PERIOD": 1,
     "MIDDLE_PERIOD": 4,
     "LONG_PERIOD": 14,
-    "SIGNAL_THRESH": 2,
     "RSV_WINDOW": 9,
     "ATR_WINDOW": 14,
     "RED_THRESHOLD": 80.0,
     "GREEN_THRESHOLD": 20.0,
-    "LONG_WEIGHT": 9,
-    "MIDDLE_WEIGHT": 3,
-    "SHORT_WEIGHT": 1,
-    "SCORE_OFFSET": 13,
     "MAX_POSITION": 1,
     "DAILY_MAX_LOSS": 1000.0,
     "POINT_VALUE": 50.0,
@@ -73,7 +69,7 @@ STRATEGY_SETTING = {
     "PAUSING_PERIOD": 14,
     "CLOSE_TIME_1": 180,     # 03:00
     "CLOSE_TIME_2": 1289,    # 21:29
-    "DATA_WINDOW": 2000,     # PERF-1: 从9600降到2000
+    "DATA_WINDOW": 2000,
 }
 
 
@@ -461,5 +457,16 @@ if __name__ == "__main__":
         end = DEFAULT_END
 
     show_chart = "--chart" in sys.argv
+
+    # 支持 --csv 参数指定数据文件
+    csv_arg = None
+    if "--csv" in sys.argv:
+        idx = sys.argv.index("--csv")
+        if idx + 1 < len(sys.argv):
+            csv_arg = sys.argv[idx + 1]
+
+    if csv_arg:
+        global CSV_PATH
+        CSV_PATH = csv_arg
 
     run_backtest(start, end, show_chart=show_chart)
